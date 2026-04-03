@@ -1,0 +1,111 @@
+name: Build aubio for Android (legacy script style)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # 手动触发
+
+env:
+  NDK_VERSION: r12b   # 与你本地脚本使用的版本一致
+  MIN_PLATFORM: android-19
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04   # NDK r12 需要较旧的 Ubuntu（glibc 兼容性）
+    strategy:
+      matrix:
+        arch: [arm, arm64, x86, x86_64]
+        # 映射 arch 到 NDK 的 --arch 参数和输出目录名
+        include:
+          - arch: arm
+            abi: armeabi-v7a
+          - arch: arm64
+            abi: arm64-v8a
+          - arch: x86
+            abi: x86
+          - arch: x86_64
+            abi: x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'  # waf 兼容的版本
+
+      - name: Setup Android NDK r12
+        run: |
+          # 下载 NDK r12b（Linux 版）
+          wget -q https://dl.google.com/android/repository/android-ndk-r12b-linux-x86_64.zip
+          unzip -q android-ndk-r12b-linux-x86_64.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r12b" >> $GITHUB_ENV
+          echo "$PWD/android-ndk-r12b" >> $GITHUB_PATH
+
+      - name: Build aubio for ${{ matrix.arch }}
+        run: |
+          set -e
+          NDK_PATH=$ANDROID_NDK_HOME
+          PLATFORM=${{ env.MIN_PLATFORM }}
+          ARCH=${{ matrix.arch }}
+          
+          # 独立工具链输出目录
+          TOOLCHAIN_DIR=$PWD/toolchain-$PLATFORM-$ARCH
+          # 避免重复创建（每个 job 是干净的，但加上判断也无妨）
+          if [ ! -d $TOOLCHAIN_DIR ]; then
+            python $NDK_PATH/build/tools/make_standalone_toolchain.py \
+              --arch $ARCH \
+              --api $PLATFORM \
+              --install-dir $TOOLCHAIN_DIR
+          fi
+          
+          # 设置编译器
+          export PATH=$TOOLCHAIN_DIR/bin:$PATH
+          export CC=clang
+          export CXX=clang++
+          
+          # 可选：指定 sysroot（make_standalone_toolchain.py 已经处理好）
+          # 使用 waf 配置和构建
+          ./waf distclean  # 清理之前可能存在的构建
+          ./waf configure \
+            --disable-avcodec \
+            --disable-samplerate \
+            --disable-jack \
+            --disable-sndfile \
+            --notests \
+            --verbose
+          ./waf build --verbose
+          
+          # 安装到临时目录
+          DESTDIR=$PWD/dist-$PLATFORM-$ARCH
+          mkdir -p $DESTDIR
+          ./waf install --destdir=$DESTDIR
+          
+          # 收集产物：libaubio.a 和头文件
+          mkdir -p artifacts/${{ matrix.abi }}/lib
+          cp build/src/libaubio.a artifacts/${{ matrix.abi }}/lib/
+          # 头文件只需复制一次（所有架构共用），可以放在最后一步统一处理
+          # 这里先暂存到架构目录的 include，后续合并
+          mkdir -p artifacts/${{ matrix.abi }}/include
+          cp -r src/*.h artifacts/${{ matrix.abi }}/include/
+
+      - name: Consolidate headers (once)
+        run: |
+          # 将所有架构的 include 合并到一个公共目录（因为头文件内容相同）
+          mkdir -p artifacts/include
+          # 取第一个架构的头文件作为代表
+          cp -r artifacts/armeabi-v7a/include/* artifacts/include/ 2>/dev/null || \
+          cp -r artifacts/arm64-v8a/include/* artifacts/include/ 2>/dev/null || \
+          cp -r artifacts/x86/include/* artifacts/include/ 2>/dev/null || \
+          cp -r artifacts/x86_64/include/* artifacts/include/
+          # 删除各个架构下的 include 目录（避免重复）
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            rm -rf artifacts/$abi/include
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aubio-android-libs
+          path: artifacts/
