@@ -1,0 +1,99 @@
+name: Build Aubio for Android
+
+# 1. 触发条件：配置工作流何时运行
+on:
+  push:
+    branches: [ "main" ]   # 当代码推送到 main 分支时触发
+  pull_request:
+    branches: [ "main" ]   # 当有指向 main 分支的 PR 时触发
+  workflow_dispatch:        # 允许你从 GitHub 网页界面手动触发
+
+# 2. 环境变量：定义可复用的路径和参数
+env:
+  NDK_VERSION: r26d
+  MIN_PLATFORM: android-21
+
+jobs:
+  build:
+    # 3. 运行环境：选择 Ubuntu 作为运行环境
+    runs-on: ubuntu-latest
+
+    # 4. 构建步骤：定义所有需要执行的命令
+    steps:
+    # 步骤 1：检出代码
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # 步骤 2：设置 Android NDK
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: ${{ env.NDK_VERSION }}
+        # 启用本地缓存，可加速后续工作流的运行
+        local-cache: true
+
+    # 步骤 3：安装 Python 和 Waf 构建依赖
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    # 步骤 4：为不同的 CPU 架构执行交叉编译
+    - name: Build Aubio for multiple ABIs
+      run: |
+        # 定义支持的 ABI 及其对应参数
+        declare -A ABIS=(
+          ["armeabi-v7a"]="arm"
+          ["arm64-v8a"]="arm64"
+          ["x86"]="x86"
+          ["x86_64"]="x86_64"
+        )
+        
+        # 循环遍历每个 ABI 进行编译
+        for abi in "${!ABIS[@]}"; do
+          echo "====================================="
+          echo "Building for ABI: $abi"
+          echo "====================================="
+          
+          # 1. 为当前 ABI 创建独立的工具链
+          $ANDROID_NDK_HOME/build/tools/make_standalone_toolchain.py \
+            --arch ${ABIS[$abi]} \
+            --api ${{ env.MIN_PLATFORM }} \
+            --install-dir ./toolchains/$abi
+            
+          # 2. 设置环境变量，让 waf 使用新创建的工具链
+          export PATH=`pwd`/toolchains/$abi/bin:$PATH
+          export CC=clang
+          export CXX=clang++
+          
+          # 3. 运行 waf 进行配置和编译
+          ./waf configure \
+            --disable-avcodec \
+            --disable-samplerate \
+            --disable-jack \
+            --disable-sndfile \
+            --notests
+          ./waf build
+            
+          # 4. 将编译好的静态库复制到带 ABI 标识的目录中
+          mkdir -p artifacts/$abi/lib
+          cp build/src/libaubio.a artifacts/$abi/lib/
+          
+          # 5. 清理构建，为下一个 ABI 做准备
+          ./waf distclean
+        done
+
+    # 步骤 5：复制头文件
+    - name: Copy header files
+      run: |
+        mkdir -p artifacts/include
+        cp -r src/*.h artifacts/include/
+
+    # 步骤 6：上传构建产物
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: aubio-android-libs
+        path: artifacts/
+        if-no-files-found: error
